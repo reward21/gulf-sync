@@ -28,6 +28,7 @@ def load_env():
         if not line or line.startswith("#") or "=" not in line:
             continue
         k, v = line.split("=", 1)
+        # IMPORTANT: override any shell-exported env vars so .env wins
         os.environ[k.strip()] = v.strip()
 
 
@@ -129,10 +130,41 @@ def discord_post(text: str):
     url = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
     if not url:
         return
-    payload = json.dumps({"content": text}).encode("utf-8")
-    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        resp.read()
+
+    payload_obj = {"content": text}
+    payload = json.dumps(payload_obj).encode("utf-8")
+
+    # Try urllib first (no deps). Add User-Agent to avoid 403 blocks.
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "gulf-sync/0.1.0 (+https://github.com/reward21/gulf-sync)",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            resp.read()
+            return
+    except Exception:
+        # Fallback to curl (your curl test returned 204, so this is reliable).
+        subprocess.run(
+            [
+                "curl",
+                "-sS",
+                "-X",
+                "POST",
+                "-H",
+                "Content-Type: application/json",
+                "-A",
+                "gulf-sync/0.1.0 (+https://github.com/reward21/gulf-sync)",
+                "-d",
+                json.dumps(payload_obj),
+                url,
+            ],
+            check=True,
+        )
 
 
 def log_discord_error(e: Exception):
@@ -258,7 +290,6 @@ def cmd_run(push=True, notify=True):
         return 0
 
     finally:
-        # Clear STOP flag after a clean run
         if STOP_FLAG.exists():
             STOP_FLAG.unlink()
         clear_busy()
