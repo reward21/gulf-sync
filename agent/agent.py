@@ -28,7 +28,7 @@ def load_env():
         if not line or line.startswith("#") or "=" not in line:
             continue
         k, v = line.split("=", 1)
-        os.environ.setdefault(k.strip(), v.strip())
+        os.environ[k.strip()] = v.strip()
 
 
 def now_ct():
