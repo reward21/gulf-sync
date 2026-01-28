@@ -1,0 +1,15 @@
+modes:
+  default_run:
+    commit: true
+    push: true
+    discord_notify: true
+
+safety:
+  protected_paths:
+    - canon/gulf_chain_index.md
+    - canon/risk_gate.md
+    - canon/spy_backtest_pipeline.md
+
+outputs:
+  sync_packets_dir: sync/packets
+  status_dir: status
