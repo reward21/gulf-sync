@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, sys, json, time, signal, subprocess
+import os, sys, json, signal, subprocess
 from datetime import datetime
 from pathlib import Path
 import urllib.request
@@ -17,6 +17,7 @@ STOP_FLAG = CONTROL / "STOP"
 
 VERSION = "0.1.0"
 
+
 # ---------- tiny env loader (no deps) ----------
 def load_env():
     env_path = ROOT / ".env"
@@ -29,9 +30,11 @@ def load_env():
         k, v = line.split("=", 1)
         os.environ.setdefault(k.strip(), v.strip())
 
+
 def now_ct():
-    # MVP: label as CT (no DST calc). Good enough for now.
+    # MVP label (not DST-aware). Good enough for now.
     return datetime.now().strftime("%Y-%m-%d %H:%M CT")
+
 
 def write_state(status, step="", detail=""):
     LOGS.mkdir(parents=True, exist_ok=True)
@@ -44,32 +47,38 @@ def write_state(status, step="", detail=""):
     }
     STATE_FILE.write_text(json.dumps(data, indent=2))
 
+
 def set_busy(step="starting", detail=""):
     LOGS.mkdir(parents=True, exist_ok=True)
     LOCK_FILE.write_text(f"{os.getpid()}\n{now_ct()}\n{step}\n{detail}\n")
     write_state("BUSY", step, detail)
+
 
 def clear_busy():
     if LOCK_FILE.exists():
         LOCK_FILE.unlink()
     write_state("IDLE", "", "")
 
+
 def is_stop_requested():
     return STOP_FLAG.exists()
 
+
 # ---------- Ctrl-C soft/hard stop ----------
 _interrupt_count = 0
+
+
 def handle_sigint(signum, frame):
     global _interrupt_count
     _interrupt_count += 1
     if _interrupt_count == 1:
-        # soft stop: create STOP flag and exit after current step
         CONTROL.mkdir(parents=True, exist_ok=True)
         STOP_FLAG.write_text(f"soft stop requested at {now_ct()}\n")
         print("\n[soft stop] STOP flag set. Finishing current step then exiting…")
     else:
         print("\n[hard stop] Forcing exit NOW.")
         os._exit(130)
+
 
 # ---------- Ollama call ----------
 def ollama_chat(prompt: str) -> str:
@@ -82,19 +91,22 @@ def ollama_chat(prompt: str) -> str:
         "stream": False,
     }
     data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers={"Content-Type":"application/json"})
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=120) as resp:
         body = resp.read().decode("utf-8")
     j = json.loads(body)
     return j.get("message", {}).get("content", "").strip()
 
+
 # ---------- Git helpers ----------
 def run_git(args):
     return subprocess.check_output(["git"] + args, cwd=str(ROOT)).decode("utf-8", errors="ignore").strip()
 
+
 def git_has_changes():
     out = run_git(["status", "--porcelain"])
     return bool(out.strip())
+
 
 def git_commit_and_push(message: str, push: bool):
     run_git(["add", "."])
@@ -102,8 +114,8 @@ def git_commit_and_push(message: str, push: bool):
     if push:
         run_git(["push"])
 
+
 def changed_files_top(n=3):
-    # last commit diff summary
     try:
         out = run_git(["show", "--name-only", "--pretty=format:"])
         files = [f for f in out.splitlines() if f.strip()]
@@ -111,21 +123,31 @@ def changed_files_top(n=3):
     except Exception:
         return []
 
+
 # ---------- Discord notify ----------
 def discord_post(text: str):
     url = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
     if not url:
         return
     payload = json.dumps({"content": text}).encode("utf-8")
-    req = urllib.request.Request(url, data=payload, headers={"Content-Type":"application/json"})
+    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=30) as resp:
         resp.read()
+
+
+def log_discord_error(e: Exception):
+    err_path = ROOT / "logs" / "discord_errors.log"
+    err_path.parent.mkdir(parents=True, exist_ok=True)
+    with err_path.open("a") as f:
+        f.write(f"{now_ct()} {repr(e)}\n")
+
 
 # ---------- Core workflow ----------
 def latest_inbox_entries(limit=3):
     INBOX.mkdir(parents=True, exist_ok=True)
     files = sorted([p for p in INBOX.glob("*.md") if p.name != "_template.md"], reverse=True)
     return files[:limit]
+
 
 def build_sync_packet():
     SYNC_PACKETS.mkdir(parents=True, exist_ok=True)
@@ -162,7 +184,6 @@ INBOX SOURCES:
 {inbox_text}
 """.strip()
 
-    # If Ollama isn't available yet, fail gracefully with a basic packet.
     try:
         packet = ollama_chat(prompt)
         if not packet:
@@ -188,14 +209,13 @@ INBOX SOURCES:
     out_path = SYNC_PACKETS / f"{ts}_sync_packet.md"
     out_path.write_text(packet + "\n")
 
-    # Also update a rolling status file
     (STATUS_DIR / "tech.md").write_text(packet + "\n")
-
     return out_path, packet
+
 
 def cmd_run(push=True, notify=True):
     if LOCK_FILE.exists():
-        print("Agent is BUSY. Run `agent status`.")
+        print("Agent is BUSY. Run `./gs status`.")
         return 2
 
     set_busy("run", "generating sync packet")
@@ -216,7 +236,6 @@ def cmd_run(push=True, notify=True):
             git_commit_and_push(msg, push=push)
 
         if notify:
-            # After commit, summarize what happened (top 3 changed files)
             top = changed_files_top(3)
             top_lines = "\n".join([f"- {f}" for f in top]) if top else "- (no file list)"
             discord_text = f"""✅✅✅ **gulf-sync run complete** ({now_ct()})
@@ -227,9 +246,13 @@ def cmd_run(push=True, notify=True):
 🎯 **Next actions**
 - Check latest sync packet in `sync/packets/`
 - Add new quick log if needed
-- Run `agent chat` for follow-ups ✨
+- Run `./gs chat` for follow-ups ✨
 """
-            discord_post(discord_text)
+            try:
+                discord_post(discord_text)
+            except Exception as e:
+                log_discord_error(e)
+                print(f"[warn] Discord notify failed: {e}")
 
         print(f"DONE. Wrote: {out_path}")
         return 0
@@ -239,6 +262,7 @@ def cmd_run(push=True, notify=True):
         if STOP_FLAG.exists():
             STOP_FLAG.unlink()
         clear_busy()
+
 
 def cmd_chat():
     print("Local chat mode. Type /exit to quit.")
@@ -255,16 +279,19 @@ def cmd_chat():
             clear_busy()
         print(f"\nAgent> {resp}")
 
+
 def cmd_status():
     if STATE_FILE.exists():
         print(STATE_FILE.read_text())
     else:
-        print(json.dumps({"status":"IDLE","ts":now_ct()}, indent=2))
+        print(json.dumps({"status": "IDLE", "ts": now_ct()}, indent=2))
+
 
 def cmd_stop():
     CONTROL.mkdir(parents=True, exist_ok=True)
     STOP_FLAG.write_text(f"stop requested at {now_ct()}\n")
     print("STOP flag created. Agent will stop at the next safe checkpoint.")
+
 
 def cmd_list():
     print("""Available commands:
@@ -277,6 +304,7 @@ Options:
   -v, --version    Version
   -l, --list       List commands
 """)
+
 
 def main():
     load_env()
@@ -295,7 +323,6 @@ def main():
 
     cmd = args[0]
     if cmd == "run":
-        # default MVP: commit + push + discord notify
         return cmd_run(push=True, notify=True)
     if cmd == "chat":
         cmd_chat()
@@ -310,6 +337,7 @@ def main():
     print(f"Unknown command: {cmd}")
     cmd_list()
     return 2
+
 
 if __name__ == "__main__":
     sys.exit(main())
