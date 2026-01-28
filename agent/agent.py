@@ -11,14 +11,17 @@ INBOX = ROOT / "inbox"
 SYNC_PACKETS = ROOT / "sync" / "packets"
 STATUS_DIR = ROOT / "status"
 
-STATE_FILE = LOGS / "state.json"
-LOCK_FILE = LOGS / "BUSY.lock"
-STOP_FLAG = CONTROL / "STOP"
+CANON_DIR = ROOT / "canon"
+OUTBOX_DIR = ROOT / "sync" / "outbox"
+LATEST_PACKET_FILE = SYNC_PACKETS / "latest.md"
 
+CHAT_KEYS = ["gulf_chain_index", "spy_backtest", "risk_gate", "tech"]
+
+STATE_FILE = STATUS_DIR / "state.json"
+STOP_FILE = CONTROL / "STOP"
 LAST_INBOX_SIG_FILE = STATUS_DIR / "last_inbox_sig.txt"
 LAST_PACKET_PATH_FILE = STATUS_DIR / "last_packet_path.txt"
 
-VERSION = "0.1.0"
 
 # ---------- tiny env loader (no deps) ----------
 def load_env():
@@ -30,7 +33,6 @@ def load_env():
         if not line or line.startswith("#") or "=" not in line:
             continue
         k, v = line.split("=", 1)
-        # IMPORTANT: override any shell-exported env vars so .env wins
         os.environ[k.strip()] = v.strip()
 
 
@@ -52,107 +54,62 @@ def write_state(status, step="", detail=""):
 
 
 def set_busy(step="starting", detail=""):
-    LOGS.mkdir(parents=True, exist_ok=True)
-    LOCK_FILE.write_text(f"{os.getpid()}\n{now_ct()}\n{step}\n{detail}\n")
-    write_state("BUSY", step, detail)
+    write_state("BUSY", step=step, detail=detail)
 
 
-def clear_busy():
-    if LOCK_FILE.exists():
-        LOCK_FILE.unlink()
-    write_state("IDLE", "", "")
-
-
-def is_stop_requested():
-    return STOP_FLAG.exists()
+def set_idle(detail=""):
+    write_state("IDLE", step="", detail=detail)
 
 
 def soft_stop():
     CONTROL.mkdir(parents=True, exist_ok=True)
-    STOP_FLAG.write_text(now_ct() + "\n")
+    STOP_FILE.write_text(now_ct() + "\n")
+    return 0
 
 
-def hard_stop():
-    # forceful: remove lock, remove stop
-    if LOCK_FILE.exists():
-        LOCK_FILE.unlink()
-    if STOP_FLAG.exists():
-        STOP_FLAG.unlink()
-    write_state("IDLE", "", "")
+def should_stop():
+    return STOP_FILE.exists()
 
 
-def run(cmd, check=True):
-    return subprocess.run(cmd, check=check, text=True, capture_output=True)
+def clear_stop_flag():
+    if STOP_FILE.exists():
+        try:
+            STOP_FILE.unlink()
+        except Exception:
+            pass
 
 
-def git_has_changes():
-    r = run(["git", "status", "--porcelain"], check=False)
-    return bool(r.stdout.strip())
-
-
-def git_commit_and_push(message, push=True):
-    run(["git", "add", "-A"])
-    run(["git", "commit", "-m", message])
-    if push:
-        run(["git", "push"])
-
-
-def changed_files_top(n=3):
-    # shows top N changed files by a stable heuristic (hash prefix of name)
-    # avoids needing a full diff parse for MVP
-    r = run(["git", "diff", "--name-only", "HEAD~1..HEAD"], check=False)
-    files = [x.strip() for x in r.stdout.splitlines() if x.strip()]
-    if not files:
-        # fall back to staged/working files if no last commit diff
-        r2 = run(["git", "status", "--porcelain"], check=False)
-        files = [ln[3:] for ln in r2.stdout.splitlines() if len(ln) > 3]
-    def score(name):
-        return int(hashlib.sha256(name.encode()).hexdigest()[:8], 16)
-    files = sorted(set(files), key=score, reverse=True)
-    return files[:n]
-
-
-def discord_post(text):
+# ---------- providers ----------
+def discord_post(text: str):
     url = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
     if not url:
-        return
-
+        raise RuntimeError("DISCORD_WEBHOOK_URL not set")
     payload = json.dumps({"content": text}).encode("utf-8")
+    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        _ = resp.read()
+    return True
+
+
+def ollama_chat(prompt: str, model: str = None):
+    # Uses local Ollama (no API spend)
+    load_env()
+    if not model:
+        model = os.environ.get("OLLAMA_MODEL", "llama3.1:8b").strip()
+    data = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+    }
     req = urllib.request.Request(
-        url,
-        data=payload,
+        "http://127.0.0.1:11434/api/generate",
+        data=json.dumps(data).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            _ = resp.read()
-            return
-    except Exception:
-        # fallback: curl (sometimes more tolerant of SSL/weird python env issues)
-        try:
-            subprocess.run(
-                ["curl", "-sS", "-H", "Content-Type: application/json", "-d", json.dumps({"content": text}), url],
-                check=False,
-            )
-        except Exception:
-            raise
-
-
-def ollama_chat(prompt, model="llama3.1:8b"):
-    # Ollama REST API default
-    url = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/") + "/api/chat"
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "stream": False,
-    }
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
     with urllib.request.urlopen(req, timeout=120) as resp:
         j = json.loads(resp.read().decode("utf-8"))
-    return j["message"]["content"]
+    return j["response"]
 
 
 def read_file_safe(p: Path, max_bytes=200_000):
@@ -166,22 +123,148 @@ def read_file_safe(p: Path, max_bytes=200_000):
 
 
 def latest_inbox_entries(limit=3):
+    """Return newest inbox markdown files (newest first).
+
+    Sort primarily by modified time (mtime), then by name for stability.
+    """
     INBOX.mkdir(parents=True, exist_ok=True)
-    files = sorted([p for p in INBOX.glob("*.md")], key=lambda x: x.name, reverse=True)
+    paths = list(INBOX.glob("*.md"))
+
+    def _key(p: Path):
+        try:
+            return (p.stat().st_mtime_ns, p.name)
+        except Exception:
+            return (0, p.name)
+
+    files = sorted(paths, key=_key, reverse=True)
     return files[:limit]
 
 
+def read_text_if_exists(p: Path, max_bytes=200_000) -> str:
+    if not p.exists():
+        return ""
+    try:
+        return p.read_text(errors="ignore")[:max_bytes]
+    except Exception:
+        return ""
+
+
+def canon_context_snippet(max_chars=6000) -> str:
+    # Collect small snippets from canon files (if present) to help routing.
+    if not CANON_DIR.exists():
+        return ""
+    parts = []
+    for name in ["gulf_chain_index.md", "risk_gate_spec.md", "spy_backtest_pipeline.md", "FEATURES_TRACKER.md"]:
+        p = CANON_DIR / name
+        if p.exists():
+            txt = read_text_if_exists(p, max_bytes=120_000).strip()
+            if txt:
+                parts.append(f"## {name}\n" + txt[:1500])
+    blob = "\n\n".join(parts).strip()
+    return blob[:max_chars]
+
+
+def ensure_outbox_dirs():
+    for k in CHAT_KEYS:
+        (OUTBOX_DIR / k).mkdir(parents=True, exist_ok=True)
+
+
+def route_outboxes(packet_text: str):
+    """
+    Write sync/outbox/<chat>/next.md files from newest packet using local Ollama.
+    Uses: PACKET + latest INBOX entries + small CANON snippets.
+    """
+    load_env()
+    ensure_outbox_dirs()
+
+    # Latest inbox files (if any)
+    inbox_files = latest_inbox_entries(limit=3)
+    inbox_text = ""
+    for p in inbox_files:
+        try:
+            inbox_text += f"\n\n---\nSOURCE: {p.name}\n---\n{p.read_text(errors='ignore')}\n"
+        except Exception:
+            pass
+
+    canon_blob = canon_context_snippet()
+
+    prompt = f"""
+You are TechGPT. You route updates to 4 ChatGPT threads by writing one markdown message per thread.
+
+THREADS (keys must match exactly):
+- gulf_chain_index
+- spy_backtest
+- risk_gate
+- tech
+
+GOAL:
+- Each message should be actionable, short, and specific to that thread.
+- DO NOT invent progress. Use only what's in PACKET + INBOX + CANON.
+- Include:
+  - "✅✅✅ Top 3 changes"
+  - "🎯 Next actions"
+- If a thread has nothing to do, say "No action needed."
+
+OUTPUT FORMAT (STRICT):
+Return VALID JSON only. No code fences. No commentary.
+Keys must be exactly: gulf_chain_index, spy_backtest, risk_gate, tech
+Values must be markdown strings.
+
+CANON (snippets):
+{canon_blob}
+
+INBOX (latest):
+{inbox_text}
+
+PACKET (latest):
+{packet_text}
+"""
+    try:
+        raw = ollama_chat(prompt).strip()
+        data = json.loads(raw)
+    except Exception:
+        # Fallback: dump packet to each outbox if parsing fails
+        data = {k: packet_text for k in CHAT_KEYS}
+
+    for k in CHAT_KEYS:
+        msg = (data.get(k) or "").strip()
+        if not msg:
+            msg = "No action needed."
+        out_path = OUTBOX_DIR / k / "next.md"
+        out_path.write_text(msg + "\n")
+
+    return True
+
+
 def inbox_signature(files):
-    """Stable signature of the current inbox inputs (names + contents)."""
+    """Stable signature of current inbox inputs.
+
+    Includes filename + modified time + size + contents, so new/edited files
+    always trigger a new signature even if the text is similar.
+    """
     h = hashlib.sha256()
     for p in sorted(files, key=lambda x: x.name):
-        h.update(p.name.encode('utf-8'))
-        h.update(b'\n')
+        # metadata
+        try:
+            st = p.stat()
+            h.update(p.name.encode("utf-8"))
+            h.update(b"|")
+            h.update(str(st.st_mtime_ns).encode("utf-8"))
+            h.update(b"|")
+            h.update(str(st.st_size).encode("utf-8"))
+            h.update(b"\n")
+        except Exception:
+            h.update(p.name.encode("utf-8"))
+            h.update(b"\n")
+
+        # content
         try:
             h.update(p.read_bytes())
         except Exception:
-            h.update(p.read_text(errors='ignore').encode('utf-8'))
-        h.update(b'\n---\n')
+            h.update(p.read_text(errors="ignore").encode("utf-8"))
+
+        h.update(b"\n---\n")
+
     return h.hexdigest()
 
 
@@ -191,7 +274,7 @@ def build_sync_packet():
     STATUS_DIR.mkdir(parents=True, exist_ok=True)
     SYNC_PACKETS.mkdir(parents=True, exist_ok=True)
 
-    inbox_files = latest_inbox_entries(limit=3)
+    inbox_files = latest_inbox_entries(limit=20)
     sig = inbox_signature(inbox_files)
     last_sig = LAST_INBOX_SIG_FILE.read_text().strip() if LAST_INBOX_SIG_FILE.exists() else ""
 
@@ -209,7 +292,7 @@ def build_sync_packet():
 
     inbox_text = ""
     for p in inbox_files:
-        inbox_text += f"\n\n---\nSOURCE: {p.name}\n---\n{p.read_text()}\n"
+        inbox_text += f"\n\n---\nSOURCE: {p.name}\n---\n{p.read_text(errors='ignore')}\n"
 
     prompt = f"""You are TechGPT, the system integrator for Cole's gulf-sync workflow.
 Your job: summarize what changed, what you did, and what Cole should do next.
@@ -231,90 +314,109 @@ Now produce the output.
         packet = ollama_chat(prompt, model=model).strip()
     except Exception:
         # fallback: minimal packet if model unavailable
-        files = changed_files_top(3)
-        packet = (
-            f"✅✅✅ gulf-sync run complete ({now_ct()})\n\n"
-            f"🧠 Top 3 changed files\n"
-            + "\n".join([f"- {f}" for f in files]) + "\n\n"
-            "🎯 Next actions\n"
-            "- Check latest sync packet in `sync/packets/`\n"
-            "- Add new quick log if needed\n"
-            "- Run `./gs chat` for follow-ups ✨\n"
-        )
+        packet = f"✅✅✅ gulf-sync run complete ({now_ct()})\n\n🧠 Top 3 changed files\n• (unknown)\n\n🎯 Next actions\n• Review inbox updates\n"
 
-    ts = datetime.now().strftime("%Y-%m-%d_%H%M")
-    out_path = SYNC_PACKETS / f"{ts}_sync_packet.md"
+    out_name = datetime.now().strftime("%Y-%m-%d_%H%M") + "_sync_packet.md"
+    out_path = SYNC_PACKETS / out_name
     out_path.write_text(packet + "\n")
 
-    (STATUS_DIR / "tech.md").write_text(packet + "\n")
-    # Persist last-run markers so repeat runs don't spam commits/notifications.
-    LAST_INBOX_SIG_FILE.write_text(sig + "\n")
+    # Stable pointer for automation: overwrite latest.md when a new packet is created.
     try:
-        rel = out_path.relative_to(ROOT)
-        LAST_PACKET_PATH_FILE.write_text(str(rel) + "\n")
+        LATEST_PACKET_FILE.write_text(packet + "\n")
+    except Exception:
+        pass
+
+    # Store last sig + last packet path
+    LAST_INBOX_SIG_FILE.write_text(sig)
+    try:
+        LAST_PACKET_PATH_FILE.write_text(str(out_path.relative_to(ROOT)) + "\n")
     except Exception:
         LAST_PACKET_PATH_FILE.write_text(str(out_path) + "\n")
+
+    # Keep a tech status copy
+    try:
+        (STATUS_DIR / "tech.md").write_text(packet + "\n")
+    except Exception:
+        pass
 
     return out_path, packet, True
 
 
+def git_commit_push(msg="gulf-sync: sync", push=True):
+    # Only commit if there are changes (avoid empty commits)
+    r = subprocess.run(["git", "status", "--porcelain"], cwd=str(ROOT), capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or "git status failed")
+    if not r.stdout.strip():
+        return False
+
+    subprocess.check_call(["git", "add", "-A"], cwd=str(ROOT))
+    subprocess.check_call(["git", "commit", "-m", msg], cwd=str(ROOT))
+    if push:
+        subprocess.check_call(["git", "push"], cwd=str(ROOT))
+    return True
+
+
 def cmd_status():
-    load_env()
+    STATUS_DIR.mkdir(parents=True, exist_ok=True)
     if STATE_FILE.exists():
         print(STATE_FILE.read_text())
-    else:
-        print(json.dumps({"status": "IDLE", "step": "", "detail": "", "ts": now_ct(), "pid": None}, indent=2))
+        return 0
+    print(json.dumps({"status": "IDLE", "step": "", "detail": "", "ts": now_ct(), "pid": os.getpid()}, indent=2))
+    return 0
 
 
 def cmd_run(push=True, notify=True):
     load_env()
-    if LOCK_FILE.exists():
-        print("Agent is BUSY. Run `./gs status`.")
-        return 2
+    clear_stop_flag()
 
-    set_busy("run", "generating sync packet")
+    set_busy("packet", "building packet")
+    out_path, packet, changed = build_sync_packet()
+
+    # Route per-thread outbox messages (sync/outbox/<chat>/next.md)
     try:
-        if is_stop_requested():
-            print("STOP flag set. Exiting.")
-            return 0
+        set_busy("route", "writing outboxes")
+    except Exception:
+        pass
+    try:
+        route_outboxes(packet)
+    except Exception as e:
+        print(f"[warn] Outbox routing failed: {e}")
 
-        out_path, packet, changed = build_sync_packet()
-
-        if not changed:
-            print(f"No new inbox changes. Reused: {out_path}")
-            return 0
-
-        if is_stop_requested():
-            print("STOP requested. Exiting before commit.")
-            return 0
-
-        if git_has_changes():
-            msg = f"Sync packet update ({now_ct()})"
-            set_busy("git", "committing changes")
-            git_commit_and_push(msg, push=push)
-
-        if notify:
-            set_busy("notify", "posting to discord")
-            files = changed_files_top(3)
-            discord_text = packet.strip()
-
-            # ensure top 3 changed files are present in message (in case model didn't include them)
-            if "Top 3" not in discord_text:
-                discord_text += "\n\n🧠 Top 3 changed files\n" + "\n".join([f"- {f}" for f in files])
-                discord_text += "\n\n🎯 Next actions\n- Check latest sync packet in `sync/packets/`\n- Run `./gs chat` ✨\n"
-
-            try:
-                discord_post(discord_text)
-            except Exception as e:
-                print(f"[warn] Discord notify failed: {e}")
-
-        print(f"DONE. Wrote: {out_path}")
+    # If no inbox changes, we're done (routing still wrote outboxes based on latest packet).
+    if not changed:
+        set_idle("reused packet")
+        print(f"No new inbox changes. Reused: {out_path}")
         return 0
-    finally:
-        clear_busy()
-        # clear STOP flag after a run attempt (MVP choice)
-        if STOP_FLAG.exists():
-            STOP_FLAG.unlink()
+
+    if should_stop():
+        set_idle("stopped before commit")
+        return 0
+
+    committed = False
+    try:
+        set_busy("git", "commit/push")
+        committed = git_commit_push(msg=f"gulf-sync: {out_path.name}", push=push)
+    except Exception as e:
+        print(f"[warn] Git commit/push failed: {e}")
+
+    if should_stop():
+        set_idle("stopped before notify")
+        return 0
+
+    if notify:
+        try:
+            set_busy("notify", "discord")
+            discord_post(packet)
+        except Exception as e:
+            print(f"[warn] Discord notify failed: {e}")
+
+    set_idle("done")
+    if committed:
+        print(f"DONE. Wrote: {out_path}")
+    else:
+        print(f"DONE (no git changes). Wrote: {out_path}")
+    return 0
 
 
 def cmd_chat():
@@ -334,12 +436,6 @@ def cmd_chat():
             return 0
 
 
-def cmd_stop():
-    soft_stop()
-    print("STOP flag set (soft stop).")
-    return 0
-
-
 def usage():
     print("Available commands:")
     print("  agent run        Run one sync cycle (write packet, commit, push, notify)")
@@ -352,38 +448,52 @@ def usage():
     print("  -l, --list       List commands")
 
 
-def main():
-    if len(sys.argv) == 1:
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+
+    if not argv or argv[0] in ("-h", "--help"):
         usage()
         return 0
 
-    if sys.argv[1] in ("-h", "--help"):
-        usage()
+    if argv[0] in ("-v", "--version"):
+        print("0.1.0")
         return 0
-    if sys.argv[1] in ("-v", "--version"):
-        print(VERSION)
-        return 0
-    if sys.argv[1] in ("-l", "--list"):
+
+    if argv[0] in ("-l", "--list"):
         usage()
         return 0
 
-    if sys.argv[1] != "agent":
+    if argv[0] != "agent":
         usage()
         return 2
 
-    if len(sys.argv) < 3:
+    if len(argv) < 2:
         usage()
         return 2
 
-    cmd = sys.argv[2]
-    if cmd == "run":
-        return cmd_run(push=True, notify=True)
+    cmd = argv[1]
+
+    if cmd == "status":
+        return cmd_status()
+
+    if cmd == "stop":
+        return soft_stop()
+
     if cmd == "chat":
         return cmd_chat()
-    if cmd == "status":
-        return cmd_status() or 0
-    if cmd == "stop":
-        return cmd_stop()
+
+    if cmd == "run":
+        # Allow optional flags:
+        #   --no-push
+        #   --no-notify
+        push = True
+        notify = True
+        if "--no-push" in argv:
+            push = False
+        if "--no-notify" in argv:
+            notify = False
+        return cmd_run(push=push, notify=notify)
 
     usage()
     return 2
