@@ -1,0 +1,17 @@
+# Secrets
+.env
+*.key
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Local memory + runtime
+memory/memory.db
+logs/state.json
+logs/BUSY.lock
+logs/*.log
+
+# OS junk
+.DS_Store
