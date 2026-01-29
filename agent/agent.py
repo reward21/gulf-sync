@@ -37,6 +37,61 @@ def load_env():
         os.environ[k.strip()] = v.strip()
 
 
+
+def set_env_var(key: str, value: str, env_path=None) -> None:
+    """Set KEY=VALUE inside .env (preserving comments/other lines)."""
+    env_path = env_path or (ROOT / ".env")
+    lines = env_path.read_text().splitlines() if env_path.exists() else []
+    out = []
+    found = False
+
+    for line in lines:
+        if line.strip().startswith(f"{key}="):
+            out.append(f"{key}={value}")
+            found = True
+        else:
+            out.append(line)
+
+    if not found:
+        if out and out[-1].strip() != "":
+            out.append("")
+        out.append(f"{key}={value}")
+
+    env_path.write_text("\n".join(out).rstrip() + "\n")
+
+
+def _ollama_base_url() -> str:
+    """Return base url like http://127.0.0.1:11434 (no /api/*)."""
+    u = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434").strip().rstrip("/")
+    if "/api/" in u:
+        u = u.split("/api/", 1)[0]
+    return u
+
+
+def ollama_list_models() -> list:
+    """List local Ollama models via /api/tags. Falls back to `ollama list`."""
+    base = _ollama_base_url()
+    try:
+        with urllib.request.urlopen(base + "/api/tags", timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        models = []
+        for m in data.get("models", []):
+            name = (m.get("name") or "").strip()
+            if name:
+                models.append(name)
+        return models
+    except Exception:
+        try:
+            cp = subprocess.run(["ollama", "list"], capture_output=True, text=True, check=False)
+            models = []
+            for line in (cp.stdout or "").splitlines()[1:]:
+                parts = line.split()
+                if parts:
+                    models.append(parts[0])
+            return models
+        except Exception:
+            return []
+
 def now_ct():
     # MVP label (not DST-aware). Good enough for now.
     return datetime.now().strftime("%Y-%m-%d %H:%M CT")
@@ -555,6 +610,61 @@ def inbox_signature(files):
 
 
 # ---------- commands ----------
+
+def cmd_model(args: list) -> int:
+    """Manage local Ollama model settings used by gulf-sync."""
+    load_env()
+    sub = (args[0] if args else "").strip().lower()
+
+    current_model = os.environ.get("OLLAMA_MODEL", "llama3.1:8b").strip()
+    base = _ollama_base_url()
+    models = ollama_list_models()
+
+    if sub in ("", "list"):
+        print(f"Current model: {current_model}")
+        print(f"Ollama base:   {base}")
+        if models:
+            print("\nInstalled models:")
+            for m in models:
+                mark = " *" if m == current_model else ""
+                print(f" - {m}{mark}")
+        else:
+            print("\nInstalled models: (could not fetch; is Ollama running?)")
+        print("\nUsage:")
+        print("  ./gs model list")
+        print("  ./gs model set <model_name>")
+        print("  ./gs model url")
+        print("  ./gs model set-url <base_or_endpoint_url>")
+        return 0
+
+    if sub == "url":
+        print(f"Ollama base:   {base}")
+        print(f"OLLAMA_URL:    {os.environ.get('OLLAMA_URL','').strip() or '(not set)'}")
+        return 0
+
+    if sub == "set":
+        if len(args) < 2:
+            print("usage: ./gs model set <model_name>")
+            return 2
+        wanted = args[1].strip()
+        if models and wanted not in models:
+            print(f"[warn] {wanted} not found in /api/tags. Still setting it (Ollama will error if missing).")
+        set_env_var("OLLAMA_MODEL", wanted)
+        print(f"✅ Set OLLAMA_MODEL={wanted} in .env")
+        return 0
+
+    if sub == "set-url":
+        if len(args) < 2:
+            print("usage: ./gs model set-url <base_or_endpoint_url>")
+            return 2
+        wanted = args[1].strip().rstrip("/")
+        set_env_var("OLLAMA_URL", wanted)
+        print(f"✅ Set OLLAMA_URL={wanted} in .env")
+        return 0
+
+    print("Unknown model subcommand. Try: ./gs model")
+    return 2
+
 def cmd_status():
     ensure_dirs()
     if STATE_FILE.exists():
@@ -574,19 +684,56 @@ def cmd_stop():
 def cmd_chat():
     load_env()
     model = os.environ.get("OLLAMA_MODEL", "llama3.1:8b").strip()
-    print(f"gulf-sync chat ({model}). Ctrl+C to exit.\n")
+    print(f"gulf-sync chat ({model}). Ctrl+C to exit. Type /model to list or /model set <name>.\n")
+
     while True:
         try:
             user = input("you> ").strip()
             if not user:
                 continue
-            prompt = f"You are TechGPT. Be helpful, concise, and practical.\n\nUser: {user}\nAssistant:"
-            ans = ollama_chat(prompt, model=model).strip()
+
+            # quick commands (no LLM call)
+            if user.lower() in ("/model", "/models"):
+                models = ollama_list_models()
+                current = os.environ.get("OLLAMA_MODEL", "").strip() or model
+                print(f"\nagent[{current}]> available models: {', '.join(models) if models else '(unknown)'}\n")
+                continue
+            if user.lower().startswith("/model set "):
+                wanted = user.split(" ", 2)[2].strip()
+                if not wanted:
+                    print("\nagent> usage: /model set <name>\n")
+                    continue
+                set_env_var("OLLAMA_MODEL", wanted)
+                os.environ["OLLAMA_MODEL"] = wanted
+                model = wanted
+                print(f"\nagent[{model}]> ✅ model set to {model}\n")
+                continue
+
+            system = (
+                "You are TechGPT-Agent, running LOCALLY on this computer via Ollama.\n"
+                f"Current model: {model}.\n"
+                "Rules:\n"
+                "- You are offline (no internet) unless the user explicitly tells you otherwise.\n"
+                "- You do NOT have access to the user's files unless they paste content.\n"
+                "- If asked about your model/version, state the model name exactly.\n"
+                "- Be helpful, concise, and practical.\n"
+            )
+            prompt = f"""{system}
+
+User: {user}
+Assistant:"""
+
+            try:
+                ans = ollama_chat(prompt, model=model).strip()
+            except Exception as e:
+                print(f"\nagent[{model}]> [error] Ollama call failed: {e}\n")
+                continue
+
             print(f"\nagent[{model}]> {ans}\n")
+
         except KeyboardInterrupt:
             print("\nbye 👋")
             return 0
-
 
 def cmd_run(push=True, notify=True):
     ensure_dirs()
@@ -649,16 +796,23 @@ def cmd_run(push=True, notify=True):
 
 
 def print_help():
-    print("Available commands:")
-    print("  agent run        Run one sync cycle (write packet, commit, push, notify)")
-    print("  agent chat       Interactive chat in terminal")
-    print("  agent status     Show BUSY/IDLE + current step")
-    print("  agent stop       Soft stop (sets STOP flag)")
-    print("Options:")
-    print("  -h, --help       Help")
-    print("  -v, --version    Version")
-    print("  -l, --list       List commands")
+    print("""Available commands:
+  agent run        Run one sync cycle (write packet, commit, push, notify)
+  agent chat       Interactive chat in terminal (local Ollama)
+  agent status     Show BUSY/IDLE + current step
+  agent stop       Soft stop (sets STOP flag)
 
+  model            Show current Ollama model + list installed models
+  model set <m>    Set OLLAMA_MODEL in .env
+  model list       List installed models (via /api/tags)
+  model url        Show Ollama URL settings
+  model set-url <u>Set OLLAMA_URL in .env
+
+Options:
+  -h, --help       Help
+  -v, --version    Version
+  -l, --list       List commands
+""")
 
 def main():
     args = sys.argv[1:]
@@ -672,7 +826,11 @@ def main():
         print_help()
         return 0
 
-    # allow "./gs run" and "./gs agent run"
+        # model management (./gs model ...)
+    if args[0] == "model":
+        return cmd_model(args[1:])
+
+# allow "./gs run" and "./gs agent run"
     if args[0] == "run":
         return cmd_run(push=True, notify=True)
 
