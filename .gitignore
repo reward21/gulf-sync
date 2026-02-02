@@ -8,16 +8,23 @@ __pycache__/
 *.pyc
 
 # Local memory + runtime
+sync/packets/latest.md
+sync/outbox/**/next.md
 memory/memory.db
 logs/state.json
 logs/BUSY.lock
 logs/*.log
+logs/
 
 # OS junk
 .DS_Store
 
 # runtime state
 status/state.json
+status/*.txt
+status/last_inbox_sig.txt
+status/last_packet_path.txt
+control/STOP
 
 # patch backups
 agent/*.bak_*
