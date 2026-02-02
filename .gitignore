@@ -28,3 +28,6 @@ control/STOP
 
 # patch backups
 agent/*.bak_*
+
+# zip files
+*.zip
