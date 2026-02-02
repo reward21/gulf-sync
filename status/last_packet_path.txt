@@ -1,1 +1,0 @@
-sync/packets/2026-01-28_1605_sync_packet.md
