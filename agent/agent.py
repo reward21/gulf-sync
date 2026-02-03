@@ -665,6 +665,52 @@ def cmd_model(args: list) -> int:
     print("Unknown model subcommand. Try: ./gs model")
     return 2
 
+def cmd_loop(interval_s: int = 15, push: bool = True, notify: bool = True):
+    """
+    Repeatedly runs sync cycles until STOP is requested.
+    Ctrl+C behavior:
+      - first Ctrl+C -> create STOP flag (soft stop)
+      - second Ctrl+C -> raise KeyboardInterrupt (hard stop)
+    """
+    # clear any prior STOP so loop can start clean
+    try:
+        if STOP_FLAG.exists():
+            STOP_FLAG.unlink()
+    except Exception:
+        pass
+
+    # two-stage Ctrl+C: first sets STOP, second hard exits
+    _sigint_state = {"armed": False}
+
+    def loop_sigint_handler(signum, frame):
+        if not _sigint_state["armed"]:
+            _sigint_state["armed"] = True
+            soft_stop_handler(signum, frame)  # touches STOP
+            print("Press Ctrl+C again to force quit.")
+            # arm hard-exit on next Ctrl+C
+            signal.signal(signal.SIGINT, hard_kill_handler)
+            return
+        # if somehow called again before handler swap, hard exit
+        raise KeyboardInterrupt
+
+    # install handlers
+    signal.signal(signal.SIGINT, loop_sigint_handler)
+    signal.signal(signal.SIGTERM, hard_kill_handler)
+
+    print(f"[loop] Running every {interval_s}s. Ctrl+C to stop (soft), Ctrl+C again to force quit.")
+
+    try:
+        while not stop_requested():
+            cmd_run(push=push, notify=notify)
+            if stop_requested():
+                break
+            time.sleep(max(1, int(interval_s)))
+    finally:
+        set_idle()
+
+    print("[loop] STOP detected. Exiting loop ✅")
+    return 0
+
 def cmd_status():
     ensure_dirs()
     if STATE_FILE.exists():
@@ -798,6 +844,7 @@ def cmd_run(push=True, notify=True):
 def print_help():
     print("""Available commands:
   agent run        Run one sync cycle (write packet, commit, push, notify)
+  agent loop       Run continuously until STOP/Ctrl+C (default 15s)
   agent chat       Interactive chat in terminal (local Ollama)
   agent status     Show BUSY/IDLE + current step
   agent stop       Soft stop (sets STOP flag)
@@ -830,7 +877,7 @@ def main():
     if args[0] == "model":
         return cmd_model(args[1:])
 
-# allow "./gs run" and "./gs agent run"
+# allow "./gs run" and "./gs agent run" and "./gs agent loop"
     if args[0] == "run":
         return cmd_run(push=True, notify=True)
 
@@ -855,6 +902,34 @@ def main():
             if "--no-notify" in args:
                 notify = False
             return cmd_run(push=push, notify=notify)
+
+        if sub == "loop":
+            # optional flags
+            push = True
+            notify = True
+            interval_s = 15
+
+            if "--no-push" in args:
+                push = False
+            if "--no-notify" in args:
+                notify = False
+
+            # allow: --interval 15  OR  --interval=15
+            if "--interval" in args:
+                try:
+                    i = args.index("--interval")
+                    interval_s = int(args[i + 1])
+                except Exception:
+                    interval_s = 15
+            else:
+                for a in args:
+                    if a.startswith("--interval="):
+                        try:
+                            interval_s = int(a.split("=", 1)[1])
+                        except Exception:
+                            interval_s = 15
+
+            return cmd_loop(interval_s=interval_s, push=push, notify=notify)
 
     print_help()
     return 0
