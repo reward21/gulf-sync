@@ -1,4 +1,4 @@
-# gulf-sync ✅
+# gulf-sync ✅➿🔁
 
 **Local-first “blackboard” repo for coordinating Gulf Chain agents, backtests, and governance — without copy/paste between chats.**
 
@@ -34,7 +34,7 @@ If there are **no inbox changes**, `agent run` will reuse the most recent packet
 
 ## Commands
 
-### Runner
+### Runner🏃🏃‍♂️
 
 ```bash
 ./gs agent run
@@ -42,15 +42,14 @@ If there are **no inbox changes**, `agent run` will reuse the most recent packet
 Run **one** sync cycle:
 reads inbox → writes/updates packet → updates outbox → optionally commit/push/notify.
 
-### Loop
+### Loop 🔁➿
+- **Ctrl+C once** = soft stop (creates `control/STOP`)
+- **Ctrl+C twice** = hard stop (force quit)
 
 ```bash
 ./gs agent loop
 ```
 Run continuously until stopped (default every **15s**).
-
-- **Ctrl+C once** = soft stop (creates `control/STOP`)
-- **Ctrl+C twice** = hard stop (force quit)
 
 Optional flags:
 ```bash
@@ -59,27 +58,32 @@ Optional flags:
 ./gs agent loop --no-push
 ./gs agent loop --no-notify
 ```
-### Status
+### Status ℹ️ℹ️
 
 ```bash
 ./gs agent status
 ```
 Show BUSY/IDLE + current step.
 
-### Stop (Two ways to stop:)
+### Stop 🛑✅ 
 
-  1. In loop mode terminal session:
-    - **Ctrl+C once** = soft stop (creates `control/STOP`)
-    - **Ctrl+C twice** = hard stop (force quit)
+- Two ways:
 
-  2. In another terminal session
+1️⃣ In loop mode terminal session:
+
+```bash
+# Ctrl+C once** = soft stop (creates `control/STOP`) 
+# Ctrl+C twice** = hard stop (force quit)
+```
+2️⃣ In another terminal session:
+
 ```bash
 cd /gulf-sync
 ./gs agent stop
 ```
 Soft stop request (creates `control/STOP`). Useful if you want to stop a loop from another terminal.
 
-### Local terminal chat (Ollama)
+### Local terminal chat (Ollama) 💋💋
 
 ```bash
 ./gs agent chat

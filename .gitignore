@@ -31,3 +31,8 @@ agent/*.bak_*
 
 # zip files
 *.zip
+# Local-only UI (kept out of git) till completed
+gulf-dashboard/
+
+# Local scratch / patch snapshots
+patches/

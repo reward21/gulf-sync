@@ -4,6 +4,18 @@ from datetime import datetime
 from pathlib import Path
 import urllib.request
 
+DEFAULT_TERM_TITLE = os.path.basename(os.getcwd())
+##DEFAULT_TERM_TITLE = f"{os.path.basename(os.getcwd())} (zsh)"
+
+def set_term_title(title: str) -> None:
+    """
+    Set terminal/tab title (works in iTerm2, Terminal.app, most xterm-compatible terms).
+    """
+    try:
+        print(f"\033]0;{title}\007", end="", flush=True)
+    except Exception:
+        pass
+
 ROOT = Path(__file__).resolve().parents[1]
 LOGS = ROOT / "logs"
 INBOX = ROOT / "inbox"
@@ -666,6 +678,7 @@ def cmd_model(args: list) -> int:
     return 2
 
 def cmd_loop(interval_s: int = 15, push: bool = True, notify: bool = True):
+    set_term_title("gulf-sync")
     """
     Repeatedly runs sync cycles until STOP is requested.
     Ctrl+C behavior:
@@ -707,8 +720,9 @@ def cmd_loop(interval_s: int = 15, push: bool = True, notify: bool = True):
             time.sleep(max(1, int(interval_s)))
     finally:
         set_idle()
+        set_term_title("")
 
-    print("[loop] STOP detected. Exiting loop ✅")
+    print("loop STOP detected. Exiting loop")
     return 0
 
 def cmd_status():
@@ -723,14 +737,14 @@ def cmd_status():
 def cmd_stop():
     ensure_dirs()
     STOP_FLAG.write_text(f"STOP requested {now_ct()}\n")
-    print("Soft stop requested ✅")
+    print("Soft stop requested")
     return 0
 
 
 def cmd_chat():
     load_env()
     model = os.environ.get("OLLAMA_MODEL", "llama3.1:8b").strip()
-    print(f"gulf-sync chat ({model}). Ctrl+C to exit. Type /model to list or /model set <name>.\n")
+    print(f"gulf-sync chat 💋💬 ({model})🧠. Ctrl+C to exit. Type /model to list or /model set <name>.\n")
 
     while True:
         try:
@@ -781,6 +795,80 @@ Assistant:"""
             print("\nbye 👋")
             return 0
 
+
+def cmd_handle(thread: str):
+    """Consume sync/outbox/<thread>/next.md, ask local Ollama to respond, write reply into inbox/.
+
+    This is the missing 'runner' step that closes the loop:
+      inbox -> packet/outbox (agent run) -> runner response (agent handle) -> inbox -> ...
+    """
+    load_env()
+    ensure_dirs()
+    ensure_outbox_dirs()
+
+    thread = (thread or "").strip()
+    if thread not in CHAT_KEYS:
+        print(f"Unknown thread: {thread!r}. Valid: {', '.join(CHAT_KEYS)}")
+        return 2
+
+    outbox_path = OUTBOX_DIR / thread / "next.md"
+    if not outbox_path.exists():
+        print(f"Missing outbox prompt: {outbox_path}")
+        return 2
+
+    outbox_text = outbox_path.read_text(errors="ignore").strip()
+
+    packet_text = ""
+    if LATEST_PACKET_FILE.exists():
+        packet_text = LATEST_PACKET_FILE.read_text(errors="ignore")
+
+    # extra context: a few most recent inbox sources (raw)
+    inbox_files = latest_inbox_entries(limit=8)
+    inbox_text = ""
+    for p in inbox_files:
+        try:
+            inbox_text += f"\n\n---\nSOURCE: {p.name}\n---\n{p.read_text(errors='ignore').strip()}\n"
+        except Exception:
+            continue
+
+    model = os.environ.get("OLLAMA_MODEL") or "llama3.2:latest"
+
+    system = f"""You are the local Runner Agent for GulfSync thread '{thread}'.
+
+Your job:
+- Read the OUTBOX PROMPT below (this is what we'd normally paste into OpenWebUI for that thread).
+- Use the LATEST SYNC PACKET and RECENT INBOX SOURCES as additional context.
+- Produce a *useful response* in Markdown (decisions, updates, next steps).
+- Keep it practical. No filler.
+- Output ONLY the response body (Markdown). Do not wrap in code fences.
+"""
+
+    full_prompt = (
+        system
+        + "\n\n# OUTBOX PROMPT (respond to this)\n\n"
+        + outbox_text
+        + "\n\n# LATEST SYNC PACKET (context)\n\n"
+        + (packet_text or "(no latest packet found)")
+        + "\n\n# RECENT INBOX SOURCES (raw)\n\n"
+        + (inbox_text or "(no recent inbox sources found)")
+        + "\n\n# RESPONSE\n"
+    )
+
+    set_busy("handle", f"ollama: {thread}")
+    try:
+        reply = ollama_chat(full_prompt, model=model).strip()
+    finally:
+        set_idle()
+
+    stamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    inbox_path = INBOX / f"{stamp}_agent_{thread}.md"
+    header = f"## FROM: agent\n## THREAD: {thread}\n## CREATED: {now_ct()}\n\n"
+    inbox_path.write_text(header + reply + "\n", encoding="utf-8")
+
+    # Print the created file path for callers (dashboard can display it)
+    print(str(inbox_path))
+    return 0
+
 def cmd_run(push=True, notify=True):
     ensure_dirs()
     ensure_outbox_dirs()
@@ -794,7 +882,7 @@ def cmd_run(push=True, notify=True):
 
     # If no new inbox changes, reuse packet and skip commit/push/notify.
     if not is_new:
-        print(f"No new inbox changes. Reused: {out_path}")
+        print(f"💤 No new inbox changes.🔁 Reused: {out_path}")
         set_idle()
         return 0
 
@@ -810,7 +898,7 @@ def cmd_run(push=True, notify=True):
         print(f"[warn] outbox routing failed: {e}")
 
     if stop_requested():
-        print("STOP requested — aborting before commit/push/notify.")
+        print("🛑STOP requested — aborting before commit/push/notify🛑.")
         set_idle()
         return 0
 
@@ -843,22 +931,23 @@ def cmd_run(push=True, notify=True):
 
 def print_help():
     print("""Available commands:
-  agent run        Run one sync cycle (write packet, commit, push, notify)
-  agent loop       Run continuously until STOP/Ctrl+C (default 15s)
-  agent chat       Interactive chat in terminal (local Ollama)
-  agent status     Show BUSY/IDLE + current step
-  agent stop       Soft stop (sets STOP flag)
+  agent run     🚀 Run one sync cycle (write packet, commit, push, notify)
+  agent loop    🔁 Run continuously until STOP/Ctrl+C (default 15s)
+  agent chat    💬 Interactive chat in terminal (local Ollama)
+  agent handle <thread> 🧩 Run local runner for one outbox thread (writes inbox reply)
+  agent status  ℹ️ Show BUSY/IDLE + current step
+  agent stop    🛑 Soft stop (sets STOP flag)
 
-  model            Show current Ollama model + list installed models
-  model set <m>    Set OLLAMA_MODEL in .env
-  model list       List installed models (via /api/tags)
-  model url        Show Ollama URL settings
-  model set-url <u>Set OLLAMA_URL in .env
+  model         🧠 Show current Ollama model + list installed models
+  model set <m> 🎯 Set OLLAMA_MODEL in .env
+  model list    📋 List installed models (via /api/tags)
+  model url     🌐 Show Ollama URL settings
+  model set-urln<u>🔧 Set OLLAMA_URL in .env
 
 Options:
-  -h, --help       Help
-  -v, --version    Version
-  -l, --list       List commands
+  -h, --help    ❓ Help
+  -v, --version 🏷️ Version
+  -l, --list    📜 List commands
 """)
 
 def main():
@@ -892,6 +981,24 @@ def main():
 
         if sub == "chat":
             return cmd_chat()
+
+        if sub == "handle":
+            # usage: ./gs agent handle <thread>  OR  ./gs agent handle --thread <thread>
+            thread = None
+            if len(args) >= 3 and not args[2].startswith("-"):
+                thread = args[2]
+            if "--thread" in args:
+                try:
+                    thread = args[args.index("--thread") + 1]
+                except Exception:
+                    thread = None
+            for a in args:
+                if a.startswith("--thread="):
+                    thread = a.split("=", 1)[1]
+            if not thread:
+                print("Missing thread. Example: ./gs agent handle --thread risk_gate")
+                return 2
+            return cmd_handle(thread)
 
         if sub == "run":
             # optional flags
