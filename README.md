@@ -102,7 +102,34 @@ Interactive terminal chat using your **local** Ollama server.
 ./gs model set-url <url>
 ```
 
+### Backtest Bridge
+
+```bash
+./gs bridge help
+```
+
+Use this to pull compact governance contracts from `multigate-backtest` into GulfSync without copying raw datasets.
+
+Quickstart:
+```bash
+# 1) Pull latest run once
+./gs bridge pull
+
+# 2) Keep polling for new runs every 20s
+./gs bridge loop --interval 20
+
+# 3) Poll + route through GulfSync cycle when new run appears
+./gs bridge loop --interval 20 --route
+```
+
+Full usage and routing details:
+`docs/BRIDGE_README.MD`
+
 ---
+
+## Additional docs
+
+- Bridge guide: `docs/BRIDGE_README.MD`
 
 ## Repo layout
 

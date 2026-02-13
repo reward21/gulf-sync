@@ -1,0 +1,205 @@
+{
+  "schema_version": "gulfsync_backtest_governance_contract_v1",
+  "generated_at_utc": "2026-02-11T20:31:35Z",
+  "source": {
+    "type": "multigate-backtest-api",
+    "api_base": "http://127.0.0.1:8765"
+  },
+  "run": {
+    "run_id": "20260211_195432_193aa326",
+    "created_at_utc": "2026-02-11T19:55:41.379289+00:00",
+    "date_start_et": "2018-05-01",
+    "date_end_et": "2026-02-10",
+    "symbol": "SPY,TSLA",
+    "vendor": "databento",
+    "dataset": "mixed",
+    "schema": "mixed",
+    "bar_timeframe": "1m",
+    "timezone": "America/New_York",
+    "rth_window": {
+      "enabled": true,
+      "start": "09:45:00",
+      "end": "16:00:00"
+    },
+    "start_equity": 100000.0,
+    "spec_version": "RISK_GATE_MULTI_GATES_G0-G5_v1_2026-01-29",
+    "strategy_version": "MULTIGATE_MIXED_SHORT_HEAVY_v1"
+  },
+  "governance_summary": {
+    "gate_metrics": [
+      {
+        "gate_id": "G0",
+        "trade_count": 3904,
+        "win_rate": 0.47848360655737704,
+        "pf": 0.9513774934928851,
+        "expectancy": -0.15317161885245906,
+        "maxdd": -896.7270000001008,
+        "worst_day": -136.37,
+        "worst_trade": -133.0,
+        "zero_trade_day_pct": 0.0,
+        "ending_equity": 99402.01799999984
+      },
+      {
+        "gate_id": "G1",
+        "trade_count": 174,
+        "win_rate": 0.4942528735632184,
+        "pf": 0.8761824181031806,
+        "expectancy": -91.31275403266679,
+        "maxdd": -20829.605431533942,
+        "worst_day": -3742.5886063583866,
+        "worst_trade": -3742.5886063583866,
+        "zero_trade_day_pct": 0.9161554192229039,
+        "ending_equity": 84111.5807983159
+      },
+      {
+        "gate_id": "G2",
+        "trade_count": 38,
+        "win_rate": 0.42105263157894735,
+        "pf": 0.8136277448982221,
+        "expectancy": -53.122340410150855,
+        "maxdd": -5441.717218830803,
+        "worst_day": -3361.0444169401217,
+        "worst_trade": -2574.1762073286227,
+        "zero_trade_day_pct": 0.9902862985685071,
+        "ending_equity": 97981.3510644143
+      },
+      {
+        "gate_id": "G3",
+        "trade_count": 16,
+        "win_rate": 0.375,
+        "pf": 0.8274268941402222,
+        "expectancy": -29.82151640100134,
+        "maxdd": -1310.7743956640334,
+        "worst_day": -925.0976400427978,
+        "worst_trade": -925.0976400427978,
+        "zero_trade_day_pct": 0.9933537832310838,
+        "ending_equity": 99522.85573758397
+      },
+      {
+        "gate_id": "G4",
+        "trade_count": 16,
+        "win_rate": 0.375,
+        "pf": 0.8255206014946889,
+        "expectancy": -43.01976007082498,
+        "maxdd": -1871.25550886782,
+        "worst_day": -1319.521098596257,
+        "worst_trade": -1319.521098596257,
+        "zero_trade_day_pct": 0.9933537832310838,
+        "ending_equity": 99311.68383886681
+      },
+      {
+        "gate_id": "G5",
+        "trade_count": 23,
+        "win_rate": 0.4782608695652174,
+        "pf": 1.2982392763513522,
+        "expectancy": 88.71084478670022,
+        "maxdd": -3845.711818358992,
+        "worst_day": -1796.290513385728,
+        "worst_trade": -1371.307588592517,
+        "zero_trade_day_pct": 0.9938650306748467,
+        "ending_equity": 102040.34943009407
+      }
+    ],
+    "decision_counts": [
+      {
+        "gate_id": "G0",
+        "pass_count": 3904,
+        "fail_count": 0
+      },
+      {
+        "gate_id": "G1",
+        "pass_count": 174,
+        "fail_count": 3730
+      },
+      {
+        "gate_id": "G2",
+        "pass_count": 38,
+        "fail_count": 3866
+      },
+      {
+        "gate_id": "G3",
+        "pass_count": 16,
+        "fail_count": 3888
+      },
+      {
+        "gate_id": "G4",
+        "pass_count": 16,
+        "fail_count": 3888
+      },
+      {
+        "gate_id": "G5",
+        "pass_count": 23,
+        "fail_count": 3881
+      }
+    ],
+    "top_denials_by_gate": {
+      "G1": [
+        {
+          "denial_code": "VOL_VIX_BLOCK",
+          "count": 2714
+        },
+        {
+          "denial_code": "RISK_LOSS_STREAK",
+          "count": 991
+        },
+        {
+          "denial_code": "RISK_DAILY_KILL",
+          "count": 25
+        }
+      ],
+      "G2": [
+        {
+          "denial_code": "RISK_LOSS_STREAK",
+          "count": 3866
+        }
+      ],
+      "G3": [
+        {
+          "denial_code": "RISK_LOSS_STREAK",
+          "count": 2270
+        },
+        {
+          "denial_code": "VOL_VIX_BLOCK",
+          "count": 1618
+        }
+      ],
+      "G4": [
+        {
+          "denial_code": "RISK_LOSS_STREAK",
+          "count": 2270
+        },
+        {
+          "denial_code": "VOL_VIX_BLOCK",
+          "count": 1617
+        },
+        {
+          "denial_code": "RISK_DAILY_KILL",
+          "count": 1
+        }
+      ],
+      "G5": [
+        {
+          "denial_code": "RISK_LOSS_STREAK",
+          "count": 3880
+        },
+        {
+          "denial_code": "RISK_DAILY_KILL",
+          "count": 1
+        }
+      ]
+    },
+    "best_pf_gate": "G5",
+    "best_pf": 1.2982392763513522,
+    "council_precheck": {
+      "status": "NEEDS_MORE_EVIDENCE",
+      "reason": "contract contains single-run summary; attach multi-window evidence packet for council vote"
+    }
+  },
+  "artifact_pointers": {
+    "report_path": "/Users/cole/Projects/gulfchain/multigate-backtest/runs/artifacts/reports/20260211_195432_193aa326_multigate_report.md",
+    "equity_curve_path": "/Users/cole/Projects/gulfchain/multigate-backtest/runs/artifacts/charts/20260211_195432_193aa326_equity.png",
+    "db_path": "/Users/cole/Projects/gulfchain/multigate-backtest/runs/backtests.sqlite",
+    "resolved_data_path": "/Users/cole/Projects/gulfchain/multigate-backtest/data/ingested/databento/tsla/xnas-ohlcv-1m/tsla-xnas-itch-ohlcv-1m.parquet | /Users/cole/Projects/gulfchain/multigate-backtest/data/ingested/databento/spy/arcx-ohlcv-1m/spy-arcx-pillar-ohlcv-1m.parquet",
+    "source_sidecar_path": "/Users/cole/Projects/gulfchain/multigate-backtest/data/ingested/databento/spy/arcx-ohlcv-1m/spy-arcx-pillar-ohlcv-1m.source.json"
+  }
+}

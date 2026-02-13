@@ -4,6 +4,11 @@ from datetime import datetime
 from pathlib import Path
 import urllib.request
 
+try:
+    from . import bridge as bridge_mod
+except Exception:
+    import bridge as bridge_mod
+
 DEFAULT_TERM_TITLE = os.path.basename(os.getcwd())
 ##DEFAULT_TERM_TITLE = f"{os.path.basename(os.getcwd())} (zsh)"
 
@@ -197,6 +202,28 @@ def latest_inbox_entries(limit=3):
     files = [p for p in INBOX.glob("*.md") if p.is_file()]
     files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return files[:limit]
+
+
+def _bridge_context():
+    return bridge_mod.BridgeContext(
+        root=ROOT,
+        inbox_dir=INBOX,
+        status_dir=STATUS_DIR,
+        stop_flag=STOP_FLAG,
+        now_ct=now_ct,
+        ensure_dirs=ensure_dirs,
+        set_busy=set_busy,
+        set_idle=set_idle,
+        stop_requested=stop_requested,
+        soft_stop_handler=soft_stop_handler,
+        hard_kill_handler=hard_kill_handler,
+        run_cycle=cmd_run,
+        load_env=load_env,
+    )
+
+
+def cmd_bridge(args: list) -> int:
+    return bridge_mod.cmd_bridge(_bridge_context(), args)
 
 
 # ---------- providers ----------
@@ -937,6 +964,9 @@ def print_help():
   agent handle <thread> 🧩 Run local runner for one outbox thread (writes inbox reply)
   agent status  ℹ️ Show BUSY/IDLE + current step
   agent stop    🛑 Soft stop (sets STOP flag)
+  bridge pull   🌉 Import latest backtest summary as compact governance contract
+  bridge loop   🌉🔁 Poll local backtest API and optionally route on new run
+  bridge help   📘 Bridge usage and expected terminal output
 
   model         🧠 Show current Ollama model + list installed models
   model set <m> 🎯 Set OLLAMA_MODEL in .env
@@ -948,6 +978,12 @@ Options:
   -h, --help    ❓ Help
   -v, --version 🏷️ Version
   -l, --list    📜 List commands
+
+Bridge quick usage:
+  ./gs bridge help
+  ./gs bridge pull
+  ./gs bridge pull --run-id <id> --force
+  ./gs bridge loop --interval 20 --route
 """)
 
 def main():
@@ -965,6 +1001,10 @@ def main():
         # model management (./gs model ...)
     if args[0] == "model":
         return cmd_model(args[1:])
+
+    # backtest governance bridge
+    if args[0] == "bridge":
+        return cmd_bridge(args[1:])
 
 # allow "./gs run" and "./gs agent run" and "./gs agent loop"
     if args[0] == "run":
