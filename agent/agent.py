@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, sys, json, signal, subprocess, hashlib, time
+import os, sys, json, signal, subprocess, hashlib, time, pty, select, threading, uuid, shlex, re
 from datetime import datetime
 from pathlib import Path
 import urllib.request
@@ -21,6 +21,15 @@ def set_term_title(title: str) -> None:
     except Exception:
         pass
 
+
+def load_personality() -> str:
+    try:
+        if AGENT_MD.exists():
+            return AGENT_MD.read_text(errors="ignore").strip()
+    except Exception:
+        pass
+    return ""
+
 ROOT = Path(__file__).resolve().parents[1]
 LOGS = ROOT / "logs"
 INBOX = ROOT / "inbox"
@@ -29,6 +38,7 @@ SYNC_PACKETS = ROOT / "sync" / "packets"
 OUTBOX_DIR = ROOT / "sync" / "outbox"
 STATUS_DIR = ROOT / "status"
 CONTROL_DIR = ROOT / "control"
+AGENT_MD = ROOT / "agent" / "agent.md"
 
 STOP_FLAG = CONTROL_DIR / "STOP"
 STATE_FILE = STATUS_DIR / "state.json"
@@ -39,6 +49,440 @@ LAST_PACKET_PATH_FILE = STATUS_DIR / "last_packet_path.txt"
 
 VERSION = "0.1.0"
 CHAT_KEYS = ["gulf_chain_index", "spy_backtest", "risk_gate", "tech"]
+
+# memory config (postgres)
+MEMORY_LIMIT_DEFAULT = int(os.environ.get("GS_MEMORY_LIMIT", "12"))
+MEMORY_ENABLED_DEFAULT = os.environ.get("GS_MEMORY_ON", "true").lower() == "true"
+MEMORY_MAX_CHARS = int(os.environ.get("GS_MEMORY_MAX_CHARS", "2000"))
+
+# ---------- shared OS terminal session (no Jupyter server) ----------
+_TERM_PID = None
+_TERM_FD = None
+_TERM_CWD = None
+_TERM_LOCK = threading.Lock()
+_SHELL_CWD = None
+AUTO_PY_DEFAULT = os.environ.get("GS_AUTO_PY", "false").lower() == "true"
+AUTO_SH_DEFAULT = os.environ.get("GS_AUTO_SH", "false").lower() == "true"
+_SESSION_ID = None
+
+try:
+    import psycopg  # psycopg v3
+    _PG_DRIVER = "psycopg"
+except Exception:
+    try:
+        import psycopg2 as psycopg  # psycopg v2 fallback
+        _PG_DRIVER = "psycopg2"
+    except Exception:
+        psycopg = None
+        _PG_DRIVER = None
+
+
+def _py_root_dir() -> Path:
+    root = os.environ.get("JUPYTER_ROOT", "").strip()
+    if root:
+        return Path(root).expanduser().resolve()
+    return Path.home().resolve()
+
+
+def _term_write(data: str) -> None:
+    if _TERM_FD is None:
+        return
+    os.write(_TERM_FD, data.encode("utf-8", errors="ignore"))
+
+
+def _term_drain(timeout_s: float = 0.2) -> None:
+    if _TERM_FD is None:
+        return
+    end = time.time() + timeout_s
+    while time.time() < end:
+        r, _, _ = select.select([_TERM_FD], [], [], 0.05)
+        if not r:
+            break
+        try:
+            os.read(_TERM_FD, 4096)
+        except Exception:
+            break
+
+
+def _term_start(cwd: Path) -> None:
+    global _TERM_PID, _TERM_FD, _TERM_CWD
+    if _TERM_FD is not None:
+        return
+    pid, fd = pty.fork()
+    if pid == 0:
+        try:
+            os.chdir(str(cwd))
+        except Exception:
+            pass
+        os.execvp("bash", ["bash", "--noprofile", "--norc", "-i"])
+    _TERM_PID = pid
+    _TERM_FD = fd
+    _TERM_CWD = cwd
+    _term_write("export PS1=''; export PROMPT_COMMAND=''; stty -echo\n")
+    _term_drain()
+
+
+def _term_stop() -> None:
+    global _TERM_PID, _TERM_FD, _TERM_CWD
+    try:
+        _term_write("exit\n")
+    except Exception:
+        pass
+    try:
+        if _TERM_FD is not None:
+            os.close(_TERM_FD)
+    except Exception:
+        pass
+    _TERM_PID = None
+    _TERM_FD = None
+    _TERM_CWD = None
+
+
+def _term_run_raw(cmd: str, timeout_s: int = 20) -> dict:
+    if _TERM_FD is None:
+        raise RuntimeError("terminal not started")
+    marker = f"__GS_END__{uuid.uuid4().hex}"
+    wrapped = f"{cmd}\nRC=$?\nPWD=$(pwd)\necho {marker} $RC $PWD\n"
+    _term_write(wrapped)
+    buf = ""
+    rc = None
+    pwd = None
+    start = time.time()
+    while time.time() - start < timeout_s:
+        r, _, _ = select.select([_TERM_FD], [], [], 0.1)
+        if not r:
+            continue
+        try:
+            chunk = os.read(_TERM_FD, 4096)
+        except Exception:
+            break
+        if not chunk:
+            break
+        buf += chunk.decode("utf-8", errors="ignore")
+        if marker in buf:
+            before, after = buf.split(marker, 1)
+            m = re.search(r"\s(-?\d+)\s+([^\r\n]+)", after)
+            if m:
+                rc = int(m.group(1))
+                pwd = m.group(2).strip()
+            buf = before
+            break
+    if rc is None:
+        return {"stdout": buf.strip(), "stderr": "[timeout]", "returncode": -1, "pwd": None}
+    return {"stdout": buf.strip(), "stderr": "", "returncode": rc, "pwd": pwd}
+
+
+def _term_ensure(cwd: Path) -> None:
+    global _TERM_CWD
+    if _TERM_FD is None:
+        _term_start(cwd)
+        return
+    if _TERM_CWD != cwd:
+        _term_run_raw(f"cd {shlex.quote(str(cwd))}", timeout_s=5)
+        _TERM_CWD = cwd
+
+
+def _execute_python(code: str, cwd: Path = None, timeout_s: int = 20) -> dict:
+    cwd = (cwd or _SHELL_CWD or _py_root_dir()).resolve()
+    if not cwd.exists():
+        raise RuntimeError(f"cwd not found: {cwd}")
+    tag = f"PY_{uuid.uuid4().hex}"
+    cmd = f"python3 - <<'{tag}'\n{code}\n{tag}"
+    res = _run_shell(cmd, cwd=cwd, timeout_s=timeout_s)
+    return {
+        "pwd": res.get("pwd", str(cwd)),
+        "stdout": res.get("stdout", ""),
+        "stderr": res.get("stderr", ""),
+        "result": "",
+        "display": "",
+    }
+
+
+def _run_shell(cmd: str, cwd: Path = None, timeout_s: int = 20) -> dict:
+    global _SHELL_CWD
+    cwd = (cwd or _SHELL_CWD or _py_root_dir()).resolve()
+    if not cwd.exists():
+        raise RuntimeError(f"cwd not found: {cwd}")
+    with _TERM_LOCK:
+        _term_ensure(cwd)
+        res = _term_run_raw(cmd, timeout_s=timeout_s)
+        if res.get("pwd"):
+            try:
+                _SHELL_CWD = Path(res["pwd"]).expanduser().resolve()
+            except Exception:
+                pass
+        return {
+            "pwd": res.get("pwd") or str(cwd),
+            "stdout": (res.get("stdout") or "").strip(),
+            "stderr": (res.get("stderr") or "").strip(),
+            "returncode": res.get("returncode", 0),
+        }
+
+
+def _extract_json(text: str) -> str | None:
+    if not text:
+        return None
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    return text[start : end + 1]
+
+
+def _pg_dsn() -> str:
+    return os.environ.get(
+        "GS_PG_DSN", "postgresql://cole@127.0.0.1:5432/agent_memory"
+    ).strip()
+
+
+def _pg_table() -> str:
+    schema = os.environ.get("GS_PG_SCHEMA", "public").strip() or "public"
+    table = os.environ.get("GS_PG_TABLE", "agent_memory").strip() or "agent_memory"
+    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", schema):
+        schema = "public"
+    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", table):
+        table = "agent_memory"
+    return f"{schema}.{table}"
+
+
+def _pg_connect():
+    if psycopg is None:
+        raise RuntimeError(
+            "Postgres driver missing. Install `psycopg[binary]` or `psycopg2`."
+        )
+    dsn = _pg_dsn()
+    if dsn:
+        conn = psycopg.connect(dsn)
+    else:
+        conn = psycopg.connect()
+    try:
+        conn.autocommit = True
+    except Exception:
+        pass
+    return conn
+
+
+def _mem_connect():
+    conn = _pg_connect()
+    table = _pg_table()
+    cur = conn.cursor()
+    cur.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {table} (
+            id BIGSERIAL PRIMARY KEY,
+            ts TIMESTAMPTZ NOT NULL,
+            role TEXT NOT NULL,
+            kind TEXT NOT NULL DEFAULT '',
+            session_id TEXT NOT NULL,
+            content TEXT NOT NULL
+        )
+        """
+    )
+    try:
+        conn.commit()
+    except Exception:
+        pass
+    return conn
+
+
+def mem_add(role: str, content: str, kind: str = "", session_id: str | None = None) -> None:
+    if not content:
+        return
+    text = str(content)
+    if len(text) > MEMORY_MAX_CHARS:
+        text = text[:MEMORY_MAX_CHARS] + "\n...(truncated)"
+    try:
+        sid = session_id or _SESSION_ID or "default"
+        table = _pg_table()
+        conn = _mem_connect()
+        cur = conn.cursor()
+        cur.execute(
+            f"INSERT INTO {table} (ts, role, kind, session_id, content) VALUES (NOW(), %s, %s, %s, %s)",
+            (role, kind or "", sid, text),
+        )
+        try:
+            conn.commit()
+        except Exception:
+            pass
+        conn.close()
+    except Exception:
+        pass
+
+
+def mem_recent(limit: int = 12, session_id: str | None = None):
+    try:
+        sid = session_id or _SESSION_ID
+        table = _pg_table()
+        conn = _mem_connect()
+        cur = conn.cursor()
+        if sid:
+            cur.execute(
+                f"SELECT role, kind, content FROM {table} WHERE session_id=%s ORDER BY id DESC LIMIT %s",
+                (sid, int(limit)),
+            )
+        else:
+            cur.execute(
+                f"SELECT role, kind, content FROM {table} ORDER BY id DESC LIMIT %s",
+                (int(limit),),
+            )
+        rows = cur.fetchall()
+        conn.close()
+        return list(reversed(rows))
+    except Exception:
+        return []
+
+
+def mem_clear(session_id: str | None = None) -> None:
+    try:
+        sid = session_id or _SESSION_ID
+        table = _pg_table()
+        conn = _mem_connect()
+        cur = conn.cursor()
+        if sid:
+            cur.execute(f"DELETE FROM {table} WHERE session_id=%s", (sid,))
+        else:
+            cur.execute(f"DELETE FROM {table}")
+        try:
+            conn.commit()
+        except Exception:
+            pass
+        conn.close()
+    except Exception:
+        pass
+
+
+def mem_format(limit: int = 12, session_id: str | None = None) -> str:
+    rows = mem_recent(limit, session_id=session_id)
+    if not rows:
+        return ""
+    lines = []
+    for role, kind, content in rows:
+        tag = role
+        if kind:
+            tag = f"{role}:{kind}"
+        lines.append(f"{tag}> {content}")
+    return "\n".join(lines)
+
+
+def status_context() -> str:
+    if not STATE_FILE.exists():
+        return ""
+    try:
+        data = json.loads(STATE_FILE.read_text())
+        status = data.get("status", "")
+        step = data.get("step", "")
+        detail = data.get("detail", "")
+        ts = data.get("ts", "")
+        bits = [b for b in [status, step, detail, ts] if b]
+        return " | ".join(bits)
+    except Exception:
+        return ""
+
+def _normalize_cwd(cwd: str | None) -> Path | None:
+    if not cwd:
+        return None
+    raw = str(cwd).strip()
+    if not raw:
+        return None
+    lowered = raw.lower()
+    # reject common placeholder strings from LLMs
+    for bad in (
+        "/absolute/or/relative",
+        "/path/to",
+        "/your/path",
+        "<path>",
+        "<directory>",
+        "path/to",
+        "your/path",
+    ):
+        if bad in lowered:
+            return None
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+        p = _py_root_dir() / p
+    p = p.resolve()
+    if not p.exists() or not p.is_dir():
+        return None
+    return p
+
+
+def _extract_path_from_text(text: str) -> Path | None:
+    if not text:
+        return None
+    # crude path detection: absolute /... or ~/...
+    for token in text.replace(",", " ").split():
+        if token.startswith("~/") or token.startswith("/"):
+            p = Path(token).expanduser()
+            if not p.is_absolute():
+                p = _py_root_dir() / p
+            p = p.resolve()
+            if p.exists() and p.is_dir():
+                return p
+    return None
+
+
+def _maybe_handle_shell_intent(user_text: str) -> dict | None:
+    """
+    Lightweight rule-based intent for common shell tasks.
+    Returns dict with action/cmd/cwd or None to fall back to LLM.
+    """
+    text = (user_text or "").strip()
+    low = text.lower()
+
+    if low in ("pwd", "what is your pwd", "current directory", "present working directory"):
+        return {"action": "shell", "cmd": "pwd"}
+    if "pwd" in low and "password" not in low:
+        return {"action": "shell", "cmd": "pwd"}
+    if "list" in low and ("file" in low or "files" in low or "directory" in low or "folder" in low):
+        p = _extract_path_from_text(text)
+        if p:
+            return {"action": "shell", "cmd": f"ls -la {str(p)}"}
+        return {"action": "shell", "cmd": "ls -la"}
+    if any(k in low for k in ("cd into", "cd to", "navigate to", "go to", "switch to")):
+        p = _extract_path_from_text(text)
+        if p:
+            return {"action": "shell", "cmd": f"cd {str(p)}"}
+    return None
+
+
+def _extract_memory_request(text: str) -> str | None:
+    if not text:
+        return None
+    low = text.lower()
+    if re.search(r"\b(don't|do not|forget)\b", low):
+        return None
+    patterns = [
+        r"\bremember (?:that )?(?P<val>.+)",
+        r"\bsave (?:this|that)?(?: to memory)?[:,]?\s*(?P<val>.+)",
+        r"\bstore (?:this|that)?(?: in memory)?[:,]?\s*(?P<val>.+)",
+        r"\badd (?:this|that)?(?: to )?memory[:,]?\s*(?P<val>.+)",
+        r"\bnote (?:this|that)?[:,]?\s*(?P<val>.+)",
+        r"\bkeep (?:this|that)?(?: in memory)?[:,]?\s*(?P<val>.+)",
+        r"\bmemorize (?:this|that)?[:,]?\s*(?P<val>.+)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, flags=re.IGNORECASE)
+        if m:
+            val = (m.group("val") or "").strip()
+            if val:
+                return val
+    return None
+
+
+def _is_dangerous_cmd(cmd: str) -> bool:
+    low = (cmd or "").lower()
+    dangerous = [
+        "rm -rf /",
+        "rm -rf /*",
+        "mkfs",
+        "dd if=",
+        "shutdown",
+        "reboot",
+        "sudo ",
+        "kill -9 1",
+        ":(){:|:&};:",
+    ]
+    return any(x in low for x in dangerous)
 
 
 # ---------- tiny env loader (no deps) ----------
@@ -73,6 +517,29 @@ def set_env_var(key: str, value: str, env_path=None) -> None:
         if out and out[-1].strip() != "":
             out.append("")
         out.append(f"{key}={value}")
+
+    env_path.write_text("\n".join(out).rstrip() + "\n")
+
+
+def set_envrc_var(key: str, value: str, env_path=None) -> None:
+    """Set export KEY=VALUE inside .envrc (preserving comments/other lines)."""
+    env_path = env_path or (ROOT / ".envrc")
+    lines = env_path.read_text().splitlines() if env_path.exists() else []
+    out = []
+    found = False
+    needle = f"export {key}="
+
+    for line in lines:
+        if line.strip().startswith(needle):
+            out.append(f'export {key}="{value}"')
+            found = True
+        else:
+            out.append(line)
+
+    if not found:
+        if out and out[-1].strip() != "":
+            out.append("")
+        out.append(f'export {key}="{value}"')
 
     env_path.write_text("\n".join(out).rstrip() + "\n")
 
@@ -688,8 +1155,8 @@ def cmd_model(args: list) -> int:
         wanted = args[1].strip()
         if models and wanted not in models:
             print(f"[warn] {wanted} not found in /api/tags. Still setting it (Ollama will error if missing).")
-        set_env_var("OLLAMA_MODEL", wanted)
-        print(f"✅ Set OLLAMA_MODEL={wanted} in .env")
+        set_envrc_var("OLLAMA_MODEL", wanted)
+        print(f"✅ Set OLLAMA_MODEL={wanted} in .envrc")
         return 0
 
     if sub == "set-url":
@@ -697,8 +1164,8 @@ def cmd_model(args: list) -> int:
             print("usage: ./gs model set-url <base_or_endpoint_url>")
             return 2
         wanted = args[1].strip().rstrip("/")
-        set_env_var("OLLAMA_URL", wanted)
-        print(f"✅ Set OLLAMA_URL={wanted} in .env")
+        set_envrc_var("OLLAMA_URL", wanted)
+        print(f"✅ Set OLLAMA_URL={wanted} in .envrc")
         return 0
 
     print("Unknown model subcommand. Try: ./gs model")
@@ -769,9 +1236,20 @@ def cmd_stop():
 
 
 def cmd_chat():
+    global _SHELL_CWD
+    global _SESSION_ID
     load_env()
     model = os.environ.get("OLLAMA_MODEL", "llama3.1:8b").strip()
-    print(f"gulf-sync chat 💋💬 ({model})🧠. Ctrl+C to exit. Type /model to list or /model set <name>.\n")
+    if not _SESSION_ID:
+        _SESSION_ID = os.environ.get("GS_SESSION_ID", "").strip() or uuid.uuid4().hex
+    auto_py = AUTO_PY_DEFAULT
+    auto_sh = AUTO_SH_DEFAULT
+    print(
+        f"gulf-sync chat 💋💬 ({model})🧠. Ctrl+C to exit. "
+        "Type /model to list or /model set <name>.\n"
+        f"Auto python: {'ON' if auto_py else 'OFF'} (use /auto py on|off)\n"
+        f"Auto shell: {'ON' if auto_sh else 'OFF'} (use /auto sh on|off)\n"
+    )
 
     while True:
         try:
@@ -790,21 +1268,309 @@ def cmd_chat():
                 if not wanted:
                     print("\nagent> usage: /model set <name>\n")
                     continue
-                set_env_var("OLLAMA_MODEL", wanted)
+                set_envrc_var("OLLAMA_MODEL", wanted)
                 os.environ["OLLAMA_MODEL"] = wanted
                 model = wanted
                 print(f"\nagent[{model}]> ✅ model set to {model}\n")
                 continue
+            if user.lower() in ("/auto", "/auto status"):
+                print(
+                    f"\nagent> auto python is {'ON' if auto_py else 'OFF'}; "
+                    f"auto shell is {'ON' if auto_sh else 'OFF'}\n"
+                )
+                continue
+            if user.lower() in ("/auto on", "/auto true"):
+                auto_py = True
+                auto_sh = True
+                print("\nagent> ✅ auto code interpreter enabled\n")
+                continue
+            if user.lower() in ("/auto off", "/auto false"):
+                auto_py = False
+                auto_sh = False
+                print("\nagent> ✅ auto code interpreter disabled\n")
+                continue
+            if user.lower() in ("/auto py on", "/auto python on"):
+                auto_py = True
+                print("\nagent> ✅ auto python enabled\n")
+                continue
+            if user.lower() in ("/auto py off", "/auto python off"):
+                auto_py = False
+                print("\nagent> ✅ auto python disabled\n")
+                continue
+            if user.lower() in ("/auto sh on", "/auto shell on"):
+                auto_sh = True
+                print("\nagent> ✅ auto shell enabled\n")
+                continue
+            if user.lower() in ("/auto sh off", "/auto shell off"):
+                auto_sh = False
+                print("\nagent> ✅ auto shell disabled\n")
+                continue
+            if user.lower() in ("/py reset", "/py restart", "/py kill"):
+                _term_stop()
+                print("\nagent> ✅ shared shell reset\n")
+                continue
+            if user.lower() in ("/sh", "/bash"):
+                print("\nagent> usage: /sh <command>  OR  /sh (multi-line, end with ///)\n")
+                continue
+            if user.lower().startswith("/sh"):
+                cmd = ""
+                if user.strip() == "/sh":
+                    print("\nagent> enter bash (end with a line containing only ///)\n")
+                    lines = []
+                    while True:
+                        line = input("sh> ")
+                        if line.strip() == "///":
+                            break
+                        lines.append(line)
+                    cmd = "\n".join(lines).strip()
+                else:
+                    cmd = user[len("/sh") :].strip()
 
-            system = (
-                "You are TechGPT-Agent, running LOCALLY on this computer via Ollama.\n"
-                f"Current model: {model}.\n"
-                "Rules:\n"
-                "- You are offline (no internet) unless the user explicitly tells you otherwise.\n"
-                "- You do NOT have access to the user's files unless they paste content.\n"
-                "- If asked about your model/version, state the model name exactly.\n"
-                "- Be helpful, concise, and practical.\n"
-            )
+                if not cmd:
+                    print("\nagent> [error] no command provided\n")
+                    continue
+
+                try:
+                    if cmd.strip().startswith("cd ") and "&&" not in cmd and ";" not in cmd:
+                        target = cmd.strip()[3:].strip()
+                        new_cwd = _normalize_cwd(target)
+                        if not new_cwd:
+                            print(f"\nagent> [error] not a directory: {target}\n")
+                            continue
+                        _SHELL_CWD = new_cwd
+                        print(f"\nagent> ✅ shell cwd set to {_SHELL_CWD}\n")
+                        continue
+                    result = _run_shell(cmd)
+                    out = []
+                    if result.get("stdout"):
+                        out.append(result["stdout"])
+                    if result.get("stderr"):
+                        out.append(f"[stderr]\n{result['stderr']}")
+                    rendered = "\n".join([x for x in out if x]) or "(no output)"
+                    rc = result.get("returncode")
+                    print(f"\nagent[sh:{result.get('pwd')} rc={rc}]> {rendered}\n")
+                except Exception as e:
+                    print(f"\nagent[sh]> [error] {e}\n")
+                continue
+            if user.lower().startswith("/cwd "):
+                wanted = user.split(" ", 1)[1].strip()
+                if not wanted:
+                    print("\nagent> usage: /cwd <path>\n")
+                    continue
+                try:
+                    new_cwd = _normalize_cwd(wanted)
+                    if not new_cwd:
+                        print(f"\nagent> [error] not a directory: {wanted}\n")
+                        continue
+                    os.environ["JUPYTER_ROOT"] = str(new_cwd)
+                    _SHELL_CWD = new_cwd
+                    _term_ensure(new_cwd)
+                    print(f"\nagent> ✅ python cwd set to {os.environ['JUPYTER_ROOT']}\n")
+                except Exception as e:
+                    print(f"\nagent> [error] {e}\n")
+                continue
+            if user.lower().startswith("/py"):
+                # /py <code> or /py (multiline; end with ///)
+                code = ""
+                if user.strip() == "/py":
+                    print("\nagent> enter python (end with a line containing only ///)\n")
+                    lines = []
+                    while True:
+                        line = input("py> ")
+                        if line.strip() == "///":
+                            break
+                        lines.append(line)
+                    code = "\n".join(lines).strip()
+                else:
+                    code = user[len("/py") :].strip()
+
+                if not code:
+                    print("\nagent> [error] no code provided\n")
+                    continue
+
+                try:
+                    result = _execute_python(code)
+                    out = []
+                    if result.get("stdout"):
+                        out.append(result["stdout"])
+                    if result.get("result"):
+                        out.append(result["result"])
+                    if result.get("display"):
+                        out.append(result["display"])
+                    if result.get("stderr"):
+                        out.append(f"[stderr]\n{result['stderr']}")
+                    rendered = "\n".join([x for x in out if x])
+                    if not rendered:
+                        rendered = "(no output)"
+                    print(f"\nagent[py:{result.get('pwd')}]> {rendered}\n")
+                except Exception as e:
+                    print(f"\nagent[py]> [error] {e}\n")
+                continue
+
+            # memory save only if explicitly requested by user
+            mem_req = _extract_memory_request(user)
+            if mem_req and MEMORY_ENABLED_DEFAULT:
+                mem_add("user", mem_req, "memory", _SESSION_ID)
+
+            if auto_py or auto_sh:
+                # first: simple rule-based shell intents
+                if auto_sh:
+                    rule_decision = _maybe_handle_shell_intent(user)
+                    if rule_decision and rule_decision.get("action") == "shell":
+                        cmd = (rule_decision.get("cmd") or "").strip()
+                        if _is_dangerous_cmd(cmd):
+                            print("\nagent> [blocked] dangerous shell command detected\n")
+                            continue
+                        try:
+                            if cmd.strip().startswith("cd ") and "&&" not in cmd and ";" not in cmd:
+                                target = cmd.strip()[3:].strip()
+                                new_cwd = _normalize_cwd(target)
+                                if not new_cwd:
+                                    print(f"\nagent> [error] not a directory: {target}\n")
+                                    continue
+                                _SHELL_CWD = new_cwd
+                                print(f"\nagent> ✅ shell cwd set to {_SHELL_CWD}\n")
+                                continue
+                            result = _run_shell(cmd)
+                            out = []
+                            if result.get("stdout"):
+                                out.append(result["stdout"])
+                            if result.get("stderr"):
+                                out.append(f"[stderr]\n{result['stderr']}")
+                            rendered = "\n".join([x for x in out if x]) or "(no output)"
+                            rc = result.get("returncode")
+                            print(f"\nagent[sh:{result.get('pwd')} rc={rc}]> {rendered}\n")
+                            followup = ollama_chat(
+                                f"User: {user}\nShell output:\n{rendered}\n"
+                                "Note: pwd means present working directory, not password.\n"
+                                "Respond concisely.",
+                                model=model,
+                            ).strip()
+                            print(f"\nagent[{model}]> {followup}\n")
+                            # memory saving handled separately via explicit requests
+                        except Exception as e:
+                            print(f"\nagent[sh]> [error] {e}\n")
+                        continue
+
+                decision_system = (
+                    "You are a local terminal assistant. Decide whether the user request "
+                    "requires running Python or a shell command. Reply with ONLY valid JSON and no extra text.\n"
+                    "Schema:\n"
+                    "- {\"action\":\"reply\",\"message\":\"...\"}\n"
+                    "- {\"action\":\"python\",\"code\":\"...\",\"cwd\":\"/absolute/or/relative\"}\n"
+                    "- {\"action\":\"shell\",\"cmd\":\"...\",\"cwd\":\"/absolute/or/relative\"}\n"
+                    "Rules:\n"
+                    "- Use python when the user asks to list files, read/write files, "
+                    "parse data, or check a URL via HTTP libraries.\n"
+                    "- Use shell for terminal commands (ls, pwd, git status, etc).\n"
+                    "- If the user asks about the model, identity, or general questions, reply.\n"
+                    "- If python is needed, provide code only (no backticks), "
+                    "and use print() for output.\n"
+                    "- If shell is needed, provide a single bash command or script.\n"
+                    "- Only set cwd if the user explicitly names a directory. "
+                    "Never use placeholders like /absolute/or/relative.\n"
+                )
+                decision_prompt = f"""{decision_system}
+
+User: {user}
+JSON:"""
+                decision_raw = ""
+                try:
+                    decision_raw = ollama_chat(decision_prompt, model=model).strip()
+                    decision_json = _extract_json(decision_raw)
+                    decision = json.loads(decision_json) if decision_json else {}
+                except Exception:
+                    decision = {}
+
+                if decision.get("action") == "python" and auto_py:
+                    code = (decision.get("code") or "").strip()
+                    if not code:
+                        decision = {}
+                    run_cwd = _normalize_cwd(decision.get("cwd"))
+                    if decision == {}:
+                        pass
+                    else:
+                        try:
+                            result = _execute_python(code, cwd=run_cwd)
+                            out = []
+                            if result.get("stdout"):
+                                out.append(result["stdout"])
+                            if result.get("result"):
+                                out.append(result["result"])
+                            if result.get("display"):
+                                out.append(result["display"])
+                            if result.get("stderr"):
+                                out.append(f"[stderr]\n{result['stderr']}")
+                            rendered = "\n".join([x for x in out if x])
+                            if not rendered:
+                                rendered = "(no output)"
+                            print(f"\nagent[py:{result.get('pwd')}]> {rendered}\n")
+                            followup = ollama_chat(
+                                f"User: {user}\nPython output:\n{rendered}\n"
+                                "Respond concisely.",
+                                model=model,
+                            ).strip()
+                            print(f"\nagent[{model}]> {followup}\n")
+                            # memory saving handled separately via explicit requests
+                        except Exception as e:
+                            print(f"\nagent[py]> [error] {e}\n")
+                    continue
+                if decision.get("action") == "shell" and auto_sh:
+                    cmd = (decision.get("cmd") or "").strip()
+                    if not cmd:
+                        decision = {}
+                    if _is_dangerous_cmd(cmd):
+                        print("\nagent> [blocked] dangerous shell command detected\n")
+                        continue
+                    run_cwd = _normalize_cwd(decision.get("cwd"))
+                    if decision == {}:
+                        pass
+                    else:
+                        try:
+                            if cmd.strip().startswith("cd ") and "&&" not in cmd and ";" not in cmd:
+                                target = cmd.strip()[3:].strip()
+                                new_cwd = _normalize_cwd(target)
+                                if not new_cwd:
+                                    print(f"\nagent> [error] not a directory: {target}\n")
+                                    continue
+                                _SHELL_CWD = new_cwd
+                                print(f"\nagent> ✅ shell cwd set to {_SHELL_CWD}\n")
+                                continue
+                            result = _run_shell(cmd, cwd=run_cwd)
+                            out = []
+                            if result.get("stdout"):
+                                out.append(result["stdout"])
+                            if result.get("stderr"):
+                                out.append(f"[stderr]\n{result['stderr']}")
+                            rendered = "\n".join([x for x in out if x]) or "(no output)"
+                            rc = result.get("returncode")
+                            print(f"\nagent[sh:{result.get('pwd')} rc={rc}]> {rendered}\n")
+                            followup = ollama_chat(
+                                f"User: {user}\nShell output:\n{rendered}\n"
+                                "Note: pwd means present working directory, not password.\n"
+                                "Respond concisely.",
+                                model=model,
+                            ).strip()
+                            print(f"\nagent[{model}]> {followup}\n")
+                            # memory saving handled separately via explicit requests
+                        except Exception as e:
+                            print(f"\nagent[sh]> [error] {e}\n")
+                        continue
+                if decision.get("action") == "reply" and decision.get("message"):
+                    reply = str(decision.get("message")).strip()
+                    print(f"\nagent[{model}]> {reply}\n")
+                    # memory saving handled separately via explicit requests
+                    continue
+
+            mem_ctx = mem_format(MEMORY_LIMIT_DEFAULT, session_id=_SESSION_ID) if MEMORY_ENABLED_DEFAULT else ""
+            status_ctx = status_context()
+            personality = load_personality()
+            system = personality if personality else "You are TechGPT-Agent."
+            system += f"\nCurrent model: {model}.\n"
+            if status_ctx:
+                system += f"\nStatus: {status_ctx}\n"
+            if mem_ctx:
+                system += f"\nMemory:\n{mem_ctx}\n"
             prompt = f"""{system}
 
 User: {user}
@@ -817,6 +1583,7 @@ Assistant:"""
                 continue
 
             print(f"\nagent[{model}]> {ans}\n")
+            # memory saving handled separately via explicit requests
 
         except KeyboardInterrupt:
             print("\nbye 👋")
@@ -969,10 +1736,10 @@ def print_help():
   bridge help   📘 Bridge usage and expected terminal output
 
   model         🧠 Show current Ollama model + list installed models
-  model set <m> 🎯 Set OLLAMA_MODEL in .env
+  model set <m> 🎯 Set OLLAMA_MODEL in .envrc
   model list    📋 List installed models (via /api/tags)
   model url     🌐 Show Ollama URL settings
-  model set-urln<u>🔧 Set OLLAMA_URL in .env
+  model set-urln<u>🔧 Set OLLAMA_URL in .envrc
 
 Options:
   -h, --help    ❓ Help
